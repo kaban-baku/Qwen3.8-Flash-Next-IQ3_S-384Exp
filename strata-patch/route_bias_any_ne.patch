@@ -1,0 +1,413 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8659bf89..8cfc4cec 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1578,6 +1578,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   add_test(NAME route_resident_parity COMMAND route_resident_parity)
+   set_tests_properties(route_resident_parity PROPERTIES TIMEOUT 120)
+ 
++  if(STRATA_ENABLE_CUDA)
++    add_executable(route_bias_ne_parity src/kernels/route_bias_ne_parity.cu)
++    target_include_directories(route_bias_ne_parity PRIVATE ${_strata_gpu_include_directories})
++    target_link_libraries(route_bias_ne_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
++    add_test(NAME route_bias_ne_parity COMMAND route_bias_ne_parity)
++    set_tests_properties(route_bias_ne_parity PROPERTIES TIMEOUT 120)
++  endif()
++
+   add_executable(router_top10_parity src/kernels/router_top10_parity.cpp)
+   target_include_directories(router_top10_parity PRIVATE ${_strata_gpu_include_directories})
+   target_link_libraries(router_top10_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+diff --git a/include/strata/core/mtp.hpp b/include/strata/core/mtp.hpp
+index 709aba74..56256f54 100644
+--- a/include/strata/core/mtp.hpp
++++ b/include/strata/core/mtp.hpp
+@@ -50,7 +50,7 @@ public:
+     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
+     void set_prompt_len(int64_t n) { prompt_len_ = n; }
+     /// STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, opt-in, changes the output): the draft layer's router is biased like
+-    /// the verifier's STRATA_ROUTE_RESIDENT, with `res_row` (a device residency row of 512 experts: slot or -1) as the
++    /// the verifier's STRATA_ROUTE_RESIDENT, with `res_row` (a device residency row of n_expert entries: slot or -1) as the
+     /// table.  nullptr switches it off.
+     void set_route_resident(const int32_t* res_row, float margin, int lo, int hi) {
+         rr_res_ = res_row; rr_margin_ = margin; rr_lo_ = lo; rr_hi_ = hi;
+diff --git a/include/strata/kernels/native_router.hpp b/include/strata/kernels/native_router.hpp
+index a940e1b3..239a8724 100644
+--- a/include/strata/kernels/native_router.hpp
++++ b/include/strata/kernels/native_router.hpp
+@@ -23,5 +23,5 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
+ /// STRATA_ROUTE_RESIDENT: swap non-resident tail-rank experts for resident ones within `margin` logits (see the .cu).
+ /// `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident before, non-resident after.
+ void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,
+-                           int rank_lo, int rank_hi, unsigned long long* stats, void* stream);
++                           int rank_lo, int rank_hi, int n_expert, unsigned long long* stats, void* stream);
+ }
+diff --git a/include/strata/kernels/route_prior.hpp b/include/strata/kernels/route_prior.hpp
+index c00e3b24..67265e98 100644
+--- a/include/strata/kernels/route_prior.hpp
++++ b/include/strata/kernels/route_prior.hpp
+@@ -6,10 +6,10 @@
+ 
+ namespace strata::kernels {
+ 
+-/// Top-10 per token over `logits` (n_tok x 512) where a resident expert (`res_layer[e] >= 0`, the layer's residency
++/// Top-10 per token over `logits` (n_tok x n_expert) where a resident expert (`res_layer[e] >= 0`, the layer's residency
+ /// table) gets `lambda` added to its logit for the SELECTION; the weights are the router's own probabilities
+-/// (softmax over the 512 unbiased logits) renormalised over the 10 picked, as the native router does.
++/// (softmax over the unbiased logits) renormalised over the 10 picked, as the native router does.
+ void route_prior_top10(const float* logits, const int32_t* res_layer, float lambda, int32_t* ids, float* weights,
+-                       int n_tok, void* stream);
++                       int n_tok, int n_expert, void* stream);
+ 
+ }  // namespace strata::kernels
+diff --git a/src/core/mtp.cpp b/src/core/mtp.cpp
+index 5403cdc2..1a6aad04 100644
+--- a/src/core/mtp.cpp
++++ b/src/core/mtp.cpp
+@@ -1274,9 +1274,9 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
+             else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
+         }
+         }
+-        if (rr_res_ != nullptr && rr_margin_ > 0.0f && g.n_expert == 512 && K == 10) {
++        if (rr_res_ != nullptr && rr_margin_ > 0.0f && g.n_expert % 32 == 0 && g.n_expert >= 64 && g.n_expert <= 512 && K == 10) {
+             try {
+-                native_route_resident(logits_, ids_, w_, rr_res_, T, rr_margin_, rr_lo_, rr_hi_, nullptr, cs);
++                native_route_resident(logits_, ids_, w_, rr_res_, T, rr_margin_, rr_lo_, rr_hi_, (int) g.n_expert, nullptr, cs);
+             } catch (const std::exception& e) { err = std::string("mtp route-resident: ") + e.what(); return false; }
+         }
+         g_mp.stamp(9, cs);
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 47977c15..99fe8a85 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -887,6 +887,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+     release_gpu_fn().store(&release_live_verifiers);
+     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
+     rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
++    if ((g_route_prior() > 0.0f || route_resident_cfg().margin > 0.0f) &&
++        (g.n_expert % 32 != 0 || g.n_expert < 64 || g.n_expert > 512 || ss.k != 10))   // the two biases run on 64..512 x 10 only
++        std::fprintf(stderr, "strata verify: residency-biased routing is off for this model (n_expert=%d)\n", (int) g.n_expert);
+     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
+     strata::kernels::fused_gr_persist_init();   // opt-in STRATA_HC_PERSIST=1 (HIP)
+     wt_ = &wt;
+@@ -2228,14 +2231,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+         // (measured on an RTX 3060 12 GB at 2.0: story +37.6%, code +35.2%; on an RTX PRO 5000 72 GB -1.9% / -0.5%, on 2x RTX A4000
+         // -4.2% / +11.0%, so it only helps a card that streams most experts).
+         const float route_prior = g_route_prior();
+-        if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
+-            route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
+-        if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
++        if (route_prior > 0.0f && NE % 32 == 0 && NE >= 64 && NE <= 512 && K == 10 && hits_.d_res != nullptr)
++            route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, NE, cs);
++        if (route_resident_cfg().margin > 0.0f && NE % 32 == 0 && NE >= 64 && NE <= 512 && K == 10 && hits_.d_res != nullptr) {
+             // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
+             try {
+                 native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
+                                       route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
+-                                      rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
++                                      NE, rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
+             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
+         }
+         if (rs_on_ && G == 1 && n <= 8 && T <= 8)
+diff --git a/src/kernels/cuda/native_router.cu b/src/kernels/cuda/native_router.cu
+index 6611bceb..bb824a1f 100644
+--- a/src/kernels/cuda/native_router.cu
++++ b/src/kernels/cuda/native_router.cu
+@@ -250,7 +250,7 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
+     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+ }
+ 
+-// STRATA_ROUTE_RESIDENT (EXPERIMENTAL, opt-in, changes the output): residency-biased routing for 512 x 10.
++// STRATA_ROUTE_RESIDENT (EXPERIMENTAL, opt-in, changes the output): residency-biased routing for 64..512 x 10.
+ // After the top-10: for the ranks lo..hi a non-resident expert is replaced by the best resident expert not already
+ // picked when its logit is within `margin` of the replaced one; the weights are then the softmax of the selected
+ // logits (the router's renormalisation).  Tokens without a swap keep the router's exact bits.
+@@ -262,13 +262,14 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
+ // (a swap changes the set already picked), but the scan is coalesced (lane j reads f = j, j + 32, ...) and reduced
+ // within the warp.  The bits are unchanged: a strictly greater logit wins, the smallest expert index breaks ties,
+ // and the softmax is the same expression.
++template <int VPL>
+ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
+                                  const int32_t* __restrict__ res, int n_tok, float margin, int lo, int hi,
+                                  unsigned long long* __restrict__ stats) {
+     const int t = blockIdx.x;
+     if (t >= n_tok) return;
+     const int lane = (int) threadIdx.x;
+-    const float* l = logits + (size_t) t * 512;
++    const float* l = logits + (size_t) t * (32 * VPL);
+     int32_t* id = ids + (size_t) t * 10;
+     int32_t my[10];
+     for (int r = 0; r < 10; ++r) my[r] = id[r];
+@@ -281,7 +282,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
+         if (lane == 0) ++tail;
+         float bv = -INFINITY;
+         int bi = -1;
+-        for (int f = lane; f < 512; f += 32) {
++        for (int f = lane; f < 32 * VPL; f += 32) {
+             if (res[f] < 0) continue;
+             bool used = false;
+             for (int q = 0; q < 10; ++q) used |= my[q] == f;
+@@ -319,10 +320,16 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
+     }
+ }
+ void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,
+-                           int rank_lo, int rank_hi, unsigned long long* stats, void* stream) {
++                           int rank_lo, int rank_hi, int n_expert, unsigned long long* stats, void* stream) {
+     if (!stream || n_tok < 1 || !res_layer) throw std::invalid_argument("native_route_resident: bad arguments");
+-    route_resident_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(
+-        logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, stats);
++#define ROUTE_RESIDENT_CASE(V) case 32 * V: route_resident_k<V><<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, stats); break
++    switch (n_expert) {
++        ROUTE_RESIDENT_CASE(2); ROUTE_RESIDENT_CASE(3); ROUTE_RESIDENT_CASE(4); ROUTE_RESIDENT_CASE(5);
++        ROUTE_RESIDENT_CASE(6); ROUTE_RESIDENT_CASE(7); ROUTE_RESIDENT_CASE(8); ROUTE_RESIDENT_CASE(9);
++        ROUTE_RESIDENT_CASE(10); ROUTE_RESIDENT_CASE(11); ROUTE_RESIDENT_CASE(12); ROUTE_RESIDENT_CASE(13);
++        ROUTE_RESIDENT_CASE(14); ROUTE_RESIDENT_CASE(15); ROUTE_RESIDENT_CASE(16);
++    }
++#undef ROUTE_RESIDENT_CASE
+     const auto error = cudaGetLastError();
+     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+ }
+diff --git a/src/kernels/cuda/route_prior.cu b/src/kernels/cuda/route_prior.cu
+index 79a7581d..969bd621 100644
+--- a/src/kernels/cuda/route_prior.cu
++++ b/src/kernels/cuda/route_prior.cu
+@@ -2,7 +2,7 @@
+ //
+ // "Mixture of Cache-Conditional Experts" (arXiv 2412.00099), without training: when a token's 10 experts are picked,
+ // an expert already in VRAM gets a `lambda` bonus on its logit.  The SELECTION uses the biased logits; the WEIGHTS stay
+-// the router's (softmax over the 512 unbiased logits), renormalised over the 10 picked like the native router.  Fewer
++// the router's (softmax over the unbiased logits), renormalised over the 10 picked like the native router.  Fewer
+ // missed experts to copy over PCIe or compute on the CPU.  Unlike STRATA_ROUTE_RESIDENT (a missed tail expert swapped
+ // for the best resident one within a logit margin), every rank can move, by an amount the logits decide.
+ #include "strata/kernels/route_prior.hpp"
+@@ -26,21 +26,22 @@ __device__ __forceinline__ float wsum(float v) {
+     return v;
+ }
+ 
+-// one warp per token; 512 experts = 16 values per lane (as the native router)
++// one warp per token; VPL values per lane
++template <int VPL>
+ __global__ void route_prior_k(const float* __restrict__ logits, const int32_t* __restrict__ res, float lambda,
+-                                  int32_t* __restrict__ ids, float* __restrict__ weights) {
+-    const float* lg = logits + (size_t) blockIdx.x * 512;
++                              int32_t* __restrict__ ids, float* __restrict__ weights) {
++    const float* lg = logits + (size_t) blockIdx.x * (32 * VPL);
+     int32_t* id = ids + (size_t) blockIdx.x * 10;
+     float* w = weights + (size_t) blockIdx.x * 10;
+     const int lane = threadIdx.x;
+-    float p[16], s[16];
++    float p[VPL], s[VPL];
+     float mx = -INFINITY;
+ #pragma unroll
+-    for (int i = 0; i < 16; ++i) { p[i] = lg[lane + 32 * i]; mx = fmaxf(mx, p[i]); }
++    for (int i = 0; i < VPL; ++i) { p[i] = lg[lane + 32 * i]; mx = fmaxf(mx, p[i]); }
+     mx = wmax(mx);
+     float sum = 0.0f;
+ #pragma unroll
+-    for (int i = 0; i < 16; ++i) {
++    for (int i = 0; i < VPL; ++i) {
+         const int e = lane + 32 * i;
+         s[i] = p[i] + (res[e] >= 0 ? lambda : 0.0f);      // the selection score
+         p[i] = expf(p[i] - mx);                            // the router's probability (unnormalised)
+@@ -52,7 +53,7 @@ __global__ void route_prior_k(const float* __restrict__ logits, const int32_t* _
+         float best = -FLT_MAX, bp = 0.0f;
+         int be = 1 << 30;
+ #pragma unroll
+-        for (int i = 0; i < 16; ++i)
++        for (int i = 0; i < VPL; ++i)
+             if (s[i] > best) { best = s[i]; be = lane + 32 * i; bp = p[i]; }
+ #pragma unroll
+         for (int m = 16; m; m >>= 1) {
+@@ -71,9 +72,16 @@ __global__ void route_prior_k(const float* __restrict__ logits, const int32_t* _
+ }  // namespace
+ 
+ void route_prior_top10(const float* logits, const int32_t* res_layer, float lambda, int32_t* ids, float* weights,
+-                             int n_tok, void* stream) {
++                       int n_tok, int n_expert, void* stream) {
+     if (n_tok <= 0) return;
+-    route_prior_k<<<n_tok, 32, 0, (cudaStream_t) stream>>>(logits, res_layer, lambda, ids, weights);
++#define ROUTE_PRIOR_CASE(V) case 32 * V: route_prior_k<V><<<n_tok, 32, 0, (cudaStream_t) stream>>>(logits, res_layer, lambda, ids, weights); break
++    switch (n_expert) {
++        ROUTE_PRIOR_CASE(2); ROUTE_PRIOR_CASE(3); ROUTE_PRIOR_CASE(4); ROUTE_PRIOR_CASE(5);
++        ROUTE_PRIOR_CASE(6); ROUTE_PRIOR_CASE(7); ROUTE_PRIOR_CASE(8); ROUTE_PRIOR_CASE(9);
++        ROUTE_PRIOR_CASE(10); ROUTE_PRIOR_CASE(11); ROUTE_PRIOR_CASE(12); ROUTE_PRIOR_CASE(13);
++        ROUTE_PRIOR_CASE(14); ROUTE_PRIOR_CASE(15); ROUTE_PRIOR_CASE(16);
++    }
++#undef ROUTE_PRIOR_CASE
+ }
+ 
+ }  // namespace strata::kernels
+diff --git a/src/kernels/route_bias_ne_parity.cu b/src/kernels/route_bias_ne_parity.cu
+new file mode 100644
+index 00000000..a75e72ea
+--- /dev/null
++++ b/src/kernels/route_bias_ne_parity.cu
+@@ -0,0 +1,135 @@
++// STRATA_ROUTE_PRIOR and STRATA_ROUTE_RESIDENT against CPU reference routing for 256, 384 and 512 experts.
++#include "strata/kernels/native_router.hpp"
++#include "strata/kernels/route_prior.hpp"
++
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <random>
++#include <vector>
++
++namespace {
++constexpr int kTop = 10;
++constexpr int kTokens = 3;
++
++void ck(cudaError_t e, const char* what) {
++    if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); std::exit(2); }
++}
++
++void weights_for(const float* logits, const int32_t* ids, float* weights) {
++    float mx = -INFINITY;
++    for (int r = 0; r < kTop; ++r) mx = std::max(mx, logits[ids[r]]);
++    float sum = 0.0f;
++    for (int r = 0; r < kTop; ++r) { weights[r] = std::exp(logits[ids[r]] - mx); sum += weights[r]; }
++    for (int r = 0; r < kTop; ++r) weights[r] /= sum;
++}
++
++void prior_ref(const float* logits, const int32_t* res, int ne, float bias, int32_t* ids, float* weights) {
++    for (int r = 0; r < kTop; ++r) {
++        float best = -INFINITY;
++        int chosen = -1;
++        for (int e = 0; e < ne; ++e) {
++            bool used = false;
++            for (int q = 0; q < r; ++q) used |= ids[q] == e;
++            if (used) continue;
++            const float score = logits[e] + (res[e] >= 0 ? bias : 0.0f);
++            if (score > best) { best = score; chosen = e; }
++        }
++        ids[r] = chosen;
++    }
++    weights_for(logits, ids, weights);
++}
++
++void resident_ref(const float* logits, const int32_t* res, int ne, float margin, int32_t* ids, float* weights) {
++    bool swapped = false;
++    for (int r = 6; r < kTop; ++r) {
++        if (res[ids[r]] >= 0) continue;
++        float best = -INFINITY;
++        int chosen = -1;
++        for (int e = 0; e < ne; ++e) {
++            if (res[e] < 0) continue;
++            bool used = false;
++            for (int q = 0; q < kTop; ++q) used |= ids[q] == e;
++            if (used) continue;
++            if (logits[e] > best) { best = logits[e]; chosen = e; }
++        }
++        if (chosen >= 0 && logits[ids[r]] - best <= margin) { ids[r] = chosen; swapped = true; }
++    }
++    if (swapped) weights_for(logits, ids, weights);
++}
++
++bool same(const std::vector<int32_t>& ids, const std::vector<int32_t>& expected,
++          const std::vector<float>& weights, const std::vector<float>& expected_weights) {
++    if (ids != expected) return false;
++    for (size_t i = 0; i < weights.size(); ++i)
++        if (std::fabs(weights[i] - expected_weights[i]) > 2e-5f) return false;
++    return true;
++}
++}  // namespace
++
++int main() {
++    std::mt19937 rng(20261105u);
++    std::uniform_real_distribution<float> logits_rng(-3.0f, 3.0f);
++    std::uniform_int_distribution<int> resident_rng(0, 1);
++    cudaStream_t stream = nullptr;
++    ck(cudaStreamCreate(&stream), "stream");
++    float* d_logits = nullptr;
++    float* d_weights = nullptr;
++    int32_t* d_res = nullptr;
++    int32_t* d_ids = nullptr;
++    ck(cudaMalloc(&d_logits, kTokens * 512 * sizeof(float)), "logits");
++    ck(cudaMalloc(&d_weights, kTokens * kTop * sizeof(float)), "weights");
++    ck(cudaMalloc(&d_res, 512 * sizeof(int32_t)), "residency");
++    ck(cudaMalloc(&d_ids, kTokens * kTop * sizeof(int32_t)), "ids");
++
++    int bad = 0;
++    for (int ne : {256, 384, 512}) {
++        std::vector<float> logits((size_t) kTokens * ne), weights(kTokens * kTop), expected_weights(weights.size());
++        std::vector<int32_t> res(ne), ids(kTokens * kTop), expected(ids.size());
++        for (int c = 0; c < 20; ++c) {
++            for (float& v : logits) v = logits_rng(rng);
++            for (int32_t& v : res) v = resident_rng(rng) ? 0 : -1;
++            ck(cudaMemcpy(d_logits, logits.data(), logits.size() * sizeof(float), cudaMemcpyHostToDevice), "up logits");
++            ck(cudaMemcpy(d_res, res.data(), res.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "up residency");
++            for (float bias : {0.0f, 1.5f}) {
++                for (int t = 0; t < kTokens; ++t)
++                    prior_ref(logits.data() + (size_t) t * ne, res.data(), ne, bias,
++                              expected.data() + t * kTop, expected_weights.data() + t * kTop);
++                strata::kernels::route_prior_top10(d_logits, d_res, bias, d_ids, d_weights, kTokens, ne, stream);
++                ck(cudaStreamSynchronize(stream), "prior");
++                ck(cudaMemcpy(ids.data(), d_ids, ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost), "down prior ids");
++                ck(cudaMemcpy(weights.data(), d_weights, weights.size() * sizeof(float), cudaMemcpyDeviceToHost), "down prior weights");
++                if (!same(ids, expected, weights, expected_weights)) {
++                    std::fprintf(stderr, "route prior: ne=%d case=%d bias=%g differs\n", ne, c, bias);
++                    ++bad;
++                }
++
++                for (int t = 0; t < kTokens; ++t)
++                    prior_ref(logits.data() + (size_t) t * ne, res.data(), ne, 0.0f,
++                              expected.data() + t * kTop, expected_weights.data() + t * kTop);
++                ck(cudaMemcpy(d_ids, expected.data(), expected.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "up resident ids");
++                ck(cudaMemcpy(d_weights, expected_weights.data(), expected_weights.size() * sizeof(float), cudaMemcpyHostToDevice), "up resident weights");
++                for (int t = 0; t < kTokens; ++t)
++                    resident_ref(logits.data() + (size_t) t * ne, res.data(), ne, bias,
++                                 expected.data() + t * kTop, expected_weights.data() + t * kTop);
++                strata::kernels::native_route_resident(d_logits, d_ids, d_weights, d_res, kTokens, bias, 6, 9, ne,
++                                                       nullptr, stream);
++                ck(cudaStreamSynchronize(stream), "resident");
++                ck(cudaMemcpy(ids.data(), d_ids, ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost), "down resident ids");
++                ck(cudaMemcpy(weights.data(), d_weights, weights.size() * sizeof(float), cudaMemcpyDeviceToHost), "down resident weights");
++                if (!same(ids, expected, weights, expected_weights)) {
++                    std::fprintf(stderr, "route resident: ne=%d case=%d margin=%g differs\n", ne, c, bias);
++                    ++bad;
++                }
++            }
++        }
++    }
++    cudaFree(d_logits); cudaFree(d_weights); cudaFree(d_res); cudaFree(d_ids);
++    cudaStreamDestroy(stream);
++    std::printf("route_bias_ne_parity: %s\n", bad ? "FAIL" : "OK");
++    return bad ? 1 : 0;
++}
+diff --git a/src/kernels/route_resident_parity.cu b/src/kernels/route_resident_parity.cu
+index 708b24ac..37866ac0 100644
+--- a/src/kernels/route_resident_parity.cu
++++ b/src/kernels/route_resident_parity.cu
+@@ -180,7 +180,7 @@ int main() {
+         ck(cudaMemcpy(d_w_par, sentinel.data(), sentinel.size() * 4, cudaMemcpyHostToDevice), "up w par");
+         ck(cudaMemset(d_stats, 0, 4 * sizeof(unsigned long long)), "zero stats");
+         strata::kernels::native_route_resident(d_logits, d_ids_par, d_w_par, d_res, n_tok, margin, lo, hi,
+-                                               d_stats, (void*) stream);
++                                               kExperts, d_stats, (void*) stream);
+         ck(cudaStreamSynchronize(stream), "sync par");
+         unsigned long long st_par[4] = {0, 0, 0, 0};
+         ck(cudaMemcpy(st_par, d_stats, sizeof(st_par), cudaMemcpyDeviceToHost), "down stats par");
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index e2657ae2..71073b1d 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -10835,9 +10835,13 @@ int main(int argc, char** argv) {
+             int lo = 6, hi = 9;
+             if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &lo, &hi);
+             if (margin > 0.0f) {
+-                mtp.set_route_resident(thits.d_res + (size_t) (g.n_layers - 1) * (size_t) g.n_expert, margin, lo, hi);
+-                std::fprintf(stderr, "strata generate: STRATA_ROUTE_RESIDENT_MTP: the MTP draft's router is biased toward layer %lld's resident experts (margin %g, ranks %d-%d; experimental)\n",
+-                             (long long) (g.n_layers - 1), margin, lo, hi);
++                if (g.n_expert == 512 && ss.k == 10) {   // the MTP head keeps the canonical 512-expert geometry (draft_geometry): the main model's last-layer residency only lines up with it at 512
++                    mtp.set_route_resident(thits.d_res + (size_t) (g.n_layers - 1) * (size_t) g.n_expert, margin, lo, hi);
++                    std::fprintf(stderr, "strata generate: STRATA_ROUTE_RESIDENT_MTP: the MTP draft's router is biased toward layer %lld's resident experts (margin %g, ranks %d-%d; experimental)\n",
++                                 (long long) (g.n_layers - 1), margin, lo, hi);
++                } else {
++                    std::fprintf(stderr, "strata generate: STRATA_ROUTE_RESIDENT_MTP: off for this model (n_expert=%d)\n", (int) g.n_expert);
++                }
+             }
+         }
+         vh.h_res = host_res.empty() ? nullptr : host_res.data();
